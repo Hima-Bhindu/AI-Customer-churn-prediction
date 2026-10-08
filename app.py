@@ -144,6 +144,23 @@ st.markdown("""
         line-height: 1.2;
         margin-bottom: 4px;
     }
+
+    /* Bright Streamlit Metric Values */
+    [data-testid="stMetricValue"] {
+        color: #FFFFFF !important;
+        font-weight: 800 !important;
+        font-size: 30px !important;
+    }
+
+    [data-testid="stMetricLabel"] {
+        color: #CBD5E1 !important;
+        font-weight: 700 !important;
+        font-size: 12px !important;
+    }
+
+    [data-testid="stMetricDelta"] {
+        color: #FFFFFF !important;
+    }
     .kpi-subtext {
         font-size: 12px;
         color: #94A3B8;
