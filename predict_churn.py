@@ -17,6 +17,7 @@ import joblib
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
@@ -307,49 +308,238 @@ class ChurnPredictor:
             drop_cols = [c for c in [id_col, churn_col] if c and c in df_raw.columns]
             X_df = df_raw.drop(columns=drop_cols)
 
-            if churn_col is not None:
-                # Train Adaptive Model on Uploaded Dataset Features
-                y_raw = df_raw[churn_col]
-                y_num = y_true if y_true is not None else (y_raw.astype(str).str.lower().isin(['yes', '1', 'true', 'churned'])).astype(int).values
+            # Variables used by the evaluation section below.
+            acc = prec = rec = f1 = float('nan')
+            auc_val = float('nan')
+            cm = np.array([[0, 0], [0, 0]])
+            roc_data = {
+                'fpr': [0.0, 1.0],
+                'tpr': [0.0, 1.0],
+                'auc': None
+            }
 
-                cat_cols = X_df.select_dtypes(include=['object', 'category']).columns.tolist()
-                num_cols = X_df.select_dtypes(include=[np.number]).columns.tolist()
+            if churn_col is not None:
+                # ---------------------------------------------------------
+                # ADAPTIVE MODEL
+                # Train on 80% and evaluate on an unseen 20% test set.
+                # ---------------------------------------------------------
+                y_raw = df_raw[churn_col]
+
+                y_num = (
+                    y_raw.astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .isin(['yes', '1', 'true', 'churned', 'churn'])
+                    .astype(int)
+                    .values
+                )
+
+                cat_cols = X_df.select_dtypes(
+                    include=['object', 'category']
+                ).columns.tolist()
+
+                num_cols = X_df.select_dtypes(
+                    include=[np.number]
+                ).columns.tolist()
 
                 X_clean = X_df.copy()
-                for nc in num_cols:
-                    X_clean[nc] = pd.to_numeric(X_clean[nc], errors='coerce').fillna(X_clean[nc].median() if not X_clean[nc].dropna().empty else 0)
-                for cc in cat_cols:
-                    X_clean[cc] = X_clean[cc].astype(str).fillna('Unknown')
 
-                X_enc = pd.get_dummies(X_clean, columns=cat_cols, drop_first=True)
-                
-                if not X_enc.empty:
+                for nc in num_cols:
+                    numeric_values = pd.to_numeric(
+                        X_clean[nc],
+                        errors='coerce'
+                    )
+
+                    median_value = (
+                        numeric_values.median()
+                        if not numeric_values.dropna().empty
+                        else 0
+                    )
+
+                    X_clean[nc] = numeric_values.fillna(median_value)
+
+                for cc in cat_cols:
+                    X_clean[cc] = X_clean[cc].fillna('Unknown').astype(str)
+
+                X_enc = pd.get_dummies(
+                    X_clean,
+                    columns=cat_cols,
+                    drop_first=True
+                )
+
+                if not X_enc.empty and len(np.unique(y_num)) == 2:
+
                     scaler_adapt = StandardScaler()
                     X_scaled_adapt = scaler_adapt.fit_transform(X_enc)
-                    
-                    adapt_clf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
-                    adapt_clf.fit(X_scaled_adapt, y_num)
-                    
-                    probas = adapt_clf.predict_proba(X_scaled_adapt)[:, 1]
-                    
+
+                    # Stratified split keeps the churn/non-churn ratio similar.
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X_scaled_adapt,
+                        y_num,
+                        test_size=0.20,
+                        random_state=42,
+                        stratify=y_num
+                    )
+
+                    adapt_clf = RandomForestClassifier(
+                        n_estimators=100,
+                        max_depth=6,
+                        random_state=42,
+                        class_weight='balanced'
+                    )
+
+                    # Train ONLY on the training portion.
+                    adapt_clf.fit(X_train, y_train)
+
+                    # -----------------------------------------------------
+                    # TEST SET EVALUATION
+                    # -----------------------------------------------------
+                    test_probas = adapt_clf.predict_proba(X_test)[:, 1]
+                    test_pred = (test_probas >= 0.50).astype(int)
+
+                    acc = accuracy_score(y_test, test_pred)
+
+                    prec = precision_score(
+                        y_test,
+                        test_pred,
+                        zero_division=0
+                    )
+
+                    rec = recall_score(
+                        y_test,
+                        test_pred,
+                        zero_division=0
+                    )
+
+                    f1 = f1_score(
+                        y_test,
+                        test_pred,
+                        zero_division=0
+                    )
+
+                    cm = confusion_matrix(
+                        y_test,
+                        test_pred,
+                        labels=[0, 1]
+                    )
+
+                    # ROC-AUC requires both classes in the test set.
+                    if len(np.unique(y_test)) == 2:
+                        auc_val = roc_auc_score(
+                            y_test,
+                            test_probas
+                        )
+
+                        fpr, tpr, _ = roc_curve(
+                            y_test,
+                            test_probas
+                        )
+
+                        roc_data = {
+                            'fpr': fpr.tolist(),
+                            'tpr': tpr.tolist(),
+                            'auc': float(auc_val)
+                        }
+
+                    # -----------------------------------------------------
+                    # PREDICT ALL UPLOADED CUSTOMERS
+                    # These predictions are for the dashboard.
+                    # Metrics above remain test-set metrics.
+                    # -----------------------------------------------------
+                    probas = adapt_clf.predict_proba(
+                        X_scaled_adapt
+                    )[:, 1]
+
                     imp = adapt_clf.feature_importances_
-                    feat_importances_df = pd.DataFrame({'Feature': X_enc.columns, 'Importance': imp}).sort_values('Importance', ascending=False)
-                    model_status_msg = f"Trained dynamic Random Forest model on uploaded dataset ({n_rows} rows)"
+
+                    feat_importances_df = pd.DataFrame({
+                        'Feature': X_enc.columns,
+                        'Importance': imp
+                    }).sort_values(
+                        'Importance',
+                        ascending=False
+                    )
+
+                    model_status_msg = (
+                        f"Trained dynamic Random Forest using "
+                        f"80% training / 20% testing split "
+                        f"({n_rows} rows)"
+                    )
+
+                elif not X_enc.empty:
+                    # A supervised model cannot be evaluated when the
+                    # target contains only one class.
+                    scaler_adapt = StandardScaler()
+                    X_scaled_adapt = scaler_adapt.fit_transform(X_enc)
+
+                    adapt_clf = RandomForestClassifier(
+                        n_estimators=100,
+                        max_depth=6,
+                        random_state=42
+                    )
+
+                    adapt_clf.fit(X_scaled_adapt, y_num)
+
+                    probas = adapt_clf.predict_proba(
+                        X_scaled_adapt
+                    )[:, 1]
+
+                    imp = adapt_clf.feature_importances_
+
+                    feat_importances_df = pd.DataFrame({
+                        'Feature': X_enc.columns,
+                        'Importance': imp
+                    }).sort_values(
+                        'Importance',
+                        ascending=False
+                    )
+
+                    model_status_msg = (
+                        "Only one churn class is present; "
+                        "test-set classification metrics are unavailable"
+                    )
+
                 else:
                     probas = np.full(n_rows, 0.5)
-                    model_status_msg = "Insufficient feature variation for ML training"
+
+                    model_status_msg = (
+                        "Insufficient feature variation for ML training"
+                    )
+
             else:
-                # No Churn target present -> Behavioral Risk Scoring Index
-                cat_cols = X_df.select_dtypes(include=['object', 'category']).columns.tolist()
-                num_cols = X_df.select_dtypes(include=[np.number]).columns.tolist()
+                # No historical churn target -> behavioral risk scoring.
+                cat_cols = X_df.select_dtypes(
+                    include=['object', 'category']
+                ).columns.tolist()
+
+                num_cols = X_df.select_dtypes(
+                    include=[np.number]
+                ).columns.tolist()
 
                 X_clean = X_df.copy()
-                for nc in num_cols:
-                    X_clean[nc] = pd.to_numeric(X_clean[nc], errors='coerce').fillna(X_clean[nc].median() if not X_clean[nc].dropna().empty else 0)
-                for cc in cat_cols:
-                    X_clean[cc] = X_clean[cc].astype(str).fillna('Unknown')
 
-                X_enc = pd.get_dummies(X_clean, columns=cat_cols, drop_first=True)
+                for nc in num_cols:
+                    numeric_values = pd.to_numeric(
+                        X_clean[nc],
+                        errors='coerce'
+                    )
+
+                    median_value = (
+                        numeric_values.median()
+                        if not numeric_values.dropna().empty
+                        else 0
+                    )
+
+                    X_clean[nc] = numeric_values.fillna(median_value)
+
+                for cc in cat_cols:
+                    X_clean[cc] = X_clean[cc].fillna('Unknown').astype(str)
+
+                X_enc = pd.get_dummies(
+                    X_clean,
+                    columns=cat_cols,
+                    drop_first=True
+                )
 
                 if not X_enc.empty and len(num_cols) > 0:
                     scaler_adapt = StandardScaler()
@@ -357,31 +547,70 @@ class ChurnPredictor:
 
                     risk_score = np.zeros(n_rows)
                     total_weight = 0.0
+
                     for c in num_cols:
-                        z = (X_clean[c] - X_clean[c].mean()) / (X_clean[c].std() if X_clean[c].std() > 0 else 1.0)
+                        std_value = X_clean[c].std()
+
+                        z = (
+                            X_clean[c] - X_clean[c].mean()
+                        ) / (
+                            std_value if std_value > 0 else 1.0
+                        )
+
                         col_l = c.lower()
-                        if 'sat' in col_l or 'nps' in col_l or 'rating' in col_l or 'active' in col_l or 'usage' in col_l or 'tenure' in col_l:
+
+                        if (
+                            'sat' in col_l
+                            or 'nps' in col_l
+                            or 'rating' in col_l
+                            or 'active' in col_l
+                            or 'usage' in col_l
+                            or 'tenure' in col_l
+                        ):
                             risk_score -= z * 1.5
                             total_weight += 1.5
-                        elif 'call' in col_l or 'ticket' in col_l or 'complaint' in col_l or 'spend' in col_l or 'charge' in col_l:
+
+                        elif (
+                            'call' in col_l
+                            or 'ticket' in col_l
+                            or 'complaint' in col_l
+                            or 'spend' in col_l
+                            or 'charge' in col_l
+                        ):
                             risk_score += z * 1.5
                             total_weight += 1.5
+
                         else:
                             risk_score += np.abs(z) * 0.5
                             total_weight += 0.5
-                    
+
                     if total_weight > 0:
                         risk_score = risk_score / total_weight
-                    
+
                     probas = 1 / (1 + np.exp(-risk_score))
-                    
+
                     var_imp = X_enc.var().values
-                    total_var = var_imp.sum() if var_imp.sum() > 0 else 1.0
-                    feat_importances_df = pd.DataFrame({'Feature': X_enc.columns, 'Importance': var_imp / total_var}).sort_values('Importance', ascending=False)
+                    total_var = (
+                        var_imp.sum()
+                        if var_imp.sum() > 0
+                        else 1.0
+                    )
+
+                    feat_importances_df = pd.DataFrame({
+                        'Feature': X_enc.columns,
+                        'Importance': var_imp / total_var
+                    }).sort_values(
+                        'Importance',
+                        ascending=False
+                    )
+
                 else:
                     probas = np.full(n_rows, 0.35)
-                
-                model_status_msg = "Historical churn target not found. Evaluated using dynamic behavioral risk scoring."
+
+                model_status_msg = (
+                    "Historical churn target not found. "
+                    "Evaluated using dynamic behavioral risk scoring."
+                )
 
         # 4. Unsupervised K-Means Behavior Mining & Silhouette Score Selection
         drop_cols_km = [c for c in [id_col, churn_col] if c and c in df_raw.columns]
@@ -478,43 +707,105 @@ class ChurnPredictor:
         # 6. Generate Model Explanations ("Why Might This Customer Churn?")
         explanations = self._generate_customer_explanations(df_raw, probas, feat_importances_df)
 
-        # 7. Supervised Model Classification Performance Metrics (Accuracy, Precision, Recall, F1, ROC-AUC, CM, ROC curve)
-        y_pred = (probas >= 0.50).astype(int)
-        if y_true is None:
-            y_true = y_pred  # Fallback to self-evaluation if no target exists
+        # 7. Supervised Model Classification Performance Metrics
+        #
+        # IMPORTANT:
+        # For the adaptive model, acc/prec/rec/f1/auc_val/cm/roc_data
+        # were calculated above using the UNSEEN TEST SET.
+        #
+        # Never use y_pred = y_true as a fallback. That would produce
+        # artificially perfect 100% metrics.
 
-        try:
+        if churn_col is not None and not is_adaptive:
+            # Pre-trained benchmark model:
+            # evaluate predictions against the uploaded historical labels.
+            y_pred = (probas >= 0.50).astype(int)
+
             acc = accuracy_score(y_true, y_pred)
-            prec = precision_score(y_true, y_pred, zero_division=0)
-            rec = recall_score(y_true, y_pred, zero_division=0)
-            f1 = f1_score(y_true, y_pred, zero_division=0)
-            
-            # Confusion Matrix with guaranteed 2x2 shape
-            cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-            
-            if len(set(y_true)) > 1:
-                try:
-                    auc_val = roc_auc_score(y_true, probas)
-                    fpr, tpr, _ = roc_curve(y_true, probas)
-                except Exception:
-                    auc_val = 0.85
-                    fpr, tpr = np.array([0.0, 0.2, 0.5, 1.0]), np.array([0.0, 0.6, 0.85, 1.0])
-            else:
-                auc_val = 0.85
-                fpr, tpr = np.array([0.0, 0.2, 0.5, 1.0]), np.array([0.0, 0.6, 0.85, 1.0])
 
-            roc_data = {'fpr': fpr.tolist(), 'tpr': tpr.tolist(), 'auc': float(auc_val)}
-        except Exception:
-            acc, prec, rec, f1, auc_val = 0.82, 0.78, 0.80, 0.79, 0.85
-            cm = np.array([[max(1, int(n_rows*0.6)), max(0, int(n_rows*0.1))], [max(0, int(n_rows*0.1)), max(1, int(n_rows*0.2))]])
-            roc_data = {'fpr': [0.0, 0.2, 0.5, 1.0], 'tpr': [0.0, 0.6, 0.85, 1.0], 'auc': 0.85}
+            prec = precision_score(
+                y_true,
+                y_pred,
+                zero_division=0
+            )
+
+            rec = recall_score(
+                y_true,
+                y_pred,
+                zero_division=0
+            )
+
+            f1 = f1_score(
+                y_true,
+                y_pred,
+                zero_division=0
+            )
+
+            cm = confusion_matrix(
+                y_true,
+                y_pred,
+                labels=[0, 1]
+            )
+
+            if len(np.unique(y_true)) == 2:
+                auc_val = roc_auc_score(
+                    y_true,
+                    probas
+                )
+
+                fpr, tpr, _ = roc_curve(
+                    y_true,
+                    probas
+                )
+
+                roc_data = {
+                    'fpr': fpr.tolist(),
+                    'tpr': tpr.tolist(),
+                    'auc': float(auc_val)
+                }
+
+        if churn_col is None:
+            # No historical labels -> classification metrics are not valid.
+            acc = prec = rec = f1 = float('nan')
+            auc_val = float('nan')
+
+            cm = np.array([
+                [0, 0],
+                [0, 0]
+            ])
+
+            roc_data = {
+                'fpr': [0.0, 1.0],
+                'tpr': [0.0, 1.0],
+                'auc': None
+            }
 
         metrics_dict = {
-            'Accuracy': f"{acc*100:.2f}%",
-            'Precision': f"{prec*100:.2f}%",
-            'Recall': f"{rec*100:.2f}%",
-            'F1-Score': f"{f1:.4f}",
-            'ROC-AUC': f"{auc_val:.4f}"
+            'Accuracy': (
+                f"{acc * 100:.2f}%"
+                if not np.isnan(acc)
+                else "N/A"
+            ),
+            'Precision': (
+                f"{prec * 100:.2f}%"
+                if not np.isnan(prec)
+                else "N/A"
+            ),
+            'Recall': (
+                f"{rec * 100:.2f}%"
+                if not np.isnan(rec)
+                else "N/A"
+            ),
+            'F1-Score': (
+                f"{f1:.4f}"
+                if not np.isnan(f1)
+                else "N/A"
+            ),
+            'ROC-AUC': (
+                f"{auc_val:.4f}"
+                if not np.isnan(auc_val)
+                else "N/A"
+            )
         }
 
         # Assemble Output DataFrame (Guaranteed exact row count = n_rows)
