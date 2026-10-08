@@ -11,6 +11,15 @@ import os
 import sys
 import plotly.express as px
 import plotly.graph_objects as go
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    roc_curve,
+    roc_auc_score
+)
 
 # Add src to path for importing ChurnPredictor
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
@@ -145,7 +154,7 @@ st.markdown("""
         margin-bottom: 4px;
     }
 
-    /* Bright Streamlit Metric Values */
+    /* Bright native Streamlit metric values */
     [data-testid="stMetricValue"] {
         color: #FFFFFF !important;
         font-weight: 800 !important;
@@ -161,6 +170,7 @@ st.markdown("""
     [data-testid="stMetricDelta"] {
         color: #FFFFFF !important;
     }
+
     .kpi-subtext {
         font-size: 12px;
         color: #94A3B8;
@@ -339,10 +349,129 @@ def run_dataset_analysis(df_input):
         st.session_state['act_col'] = predictor.detect_activity_column(df_input)
         st.session_state['churn_col'] = predictor.detect_churn_column(df_input)
 
-        # Store evaluation metrics in session_state to prevent loss on rerun
-        st.session_state['metrics'] = df_res.attrs.get('metrics', {'Accuracy': '82.50%', 'Precision': '78.40%', 'Recall': '80.10%', 'F1-Score': '0.7924', 'ROC-AUC': '0.8512'})
-        st.session_state['confusion_matrix'] = df_res.attrs.get('confusion_matrix', np.array([[int(len(df_input)*0.6), int(len(df_input)*0.1)], [int(len(df_input)*0.1), int(len(df_input)*0.2)]]))
-        st.session_state['roc_curve'] = df_res.attrs.get('roc_curve', {'fpr': [0.0, 0.2, 0.5, 1.0], 'tpr': [0.0, 0.6, 0.85, 1.0], 'auc': 0.8512})
+        # Calculate evaluation metrics from ACTUAL historical churn labels
+        # and the model's predicted churn labels.
+        #
+        # Precision = TP / (TP + FP)
+        # Accuracy = (TP + TN) / (TP + TN + FP + FN)
+        # Recall = TP / (TP + FN)
+        # F1 = 2 * Precision * Recall / (Precision + Recall)
+        #
+        # These values are calculated from the uploaded dataset.
+        # They are NOT test-set metrics unless predict_batch() itself uses
+        # an independent test set internally.
+
+        churn_col = st.session_state['churn_col']
+
+        if churn_col is not None and churn_col in df_input.columns and 'PredictedChurn' in df_res.columns:
+            actual_raw = df_input[churn_col].astype(str).str.strip().str.lower()
+            pred_raw = df_res['PredictedChurn'].astype(str).str.strip().str.lower()
+
+            positive_values = {'yes', '1', 'true', 'churned', 'churn', 'y'}
+            negative_values = {'no', '0', 'false', 'retained', 'retain', 'n'}
+
+            actual = actual_raw.map(
+                lambda x: 1 if x in positive_values
+                else 0 if x in negative_values
+                else np.nan
+            )
+            predicted = pred_raw.map(
+                lambda x: 1 if x in positive_values
+                else 0 if x in negative_values
+                else np.nan
+            )
+
+            valid = actual.notna() & predicted.notna()
+
+            if valid.sum() > 0:
+                y_true = actual[valid].astype(int)
+                y_pred = predicted[valid].astype(int)
+
+                accuracy = accuracy_score(y_true, y_pred)
+                precision = precision_score(y_true, y_pred, zero_division=0)
+                recall = recall_score(y_true, y_pred, zero_division=0)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+
+                cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+
+                metrics = {
+                    'Accuracy': f"{accuracy * 100:.2f}%",
+                    'Precision': f"{precision * 100:.2f}%",
+                    'Recall': f"{recall * 100:.2f}%",
+                    'F1-Score': f"{f1:.4f}"
+                }
+
+                # ROC-AUC must use probability scores, not Yes/No labels.
+                if 'ChurnProbability_Raw' in df_res.columns:
+                    probability = pd.to_numeric(
+                        df_res.loc[valid, 'ChurnProbability_Raw'],
+                        errors='coerce'
+                    )
+                    roc_valid = probability.notna()
+
+                    if roc_valid.sum() > 0 and y_true[roc_valid].nunique() == 2:
+                        y_true_roc = y_true[roc_valid]
+                        y_score = probability[roc_valid]
+
+                        auc_score = roc_auc_score(y_true_roc, y_score)
+                        fpr, tpr, _ = roc_curve(y_true_roc, y_score)
+
+                        metrics['ROC-AUC'] = f"{auc_score:.4f}"
+
+                        st.session_state['roc_curve'] = {
+                            'fpr': fpr.tolist(),
+                            'tpr': tpr.tolist(),
+                            'auc': float(auc_score)
+                        }
+                    else:
+                        metrics['ROC-AUC'] = 'N/A'
+                        st.session_state['roc_curve'] = {
+                            'fpr': [0.0, 1.0],
+                            'tpr': [0.0, 1.0],
+                            'auc': None
+                        }
+                else:
+                    metrics['ROC-AUC'] = 'N/A'
+                    st.session_state['roc_curve'] = {
+                        'fpr': [0.0, 1.0],
+                        'tpr': [0.0, 1.0],
+                        'auc': None
+                    }
+
+                st.session_state['metrics'] = metrics
+                st.session_state['confusion_matrix'] = cm
+
+            else:
+                st.session_state['metrics'] = {
+                    'Accuracy': 'N/A',
+                    'Precision': 'N/A',
+                    'Recall': 'N/A',
+                    'F1-Score': 'N/A',
+                    'ROC-AUC': 'N/A'
+                }
+                st.session_state['confusion_matrix'] = np.array([[0, 0], [0, 0]])
+                st.session_state['roc_curve'] = {
+                    'fpr': [0.0, 1.0],
+                    'tpr': [0.0, 1.0],
+                    'auc': None
+                }
+
+        else:
+            # Do NOT show invented/fake metric values when historical labels
+            # are unavailable.
+            st.session_state['metrics'] = {
+                'Accuracy': 'N/A',
+                'Precision': 'N/A',
+                'Recall': 'N/A',
+                'F1-Score': 'N/A',
+                'ROC-AUC': 'N/A'
+            }
+            st.session_state['confusion_matrix'] = np.array([[0, 0], [0, 0]])
+            st.session_state['roc_curve'] = {
+                'fpr': [0.0, 1.0],
+                'tpr': [0.0, 1.0],
+                'auc': None
+            }
 
 # Helper check for analysis state
 def check_analysis_ready():
@@ -814,19 +943,31 @@ elif nav == "6. Model Performance & ROC Curve":
         df_res = st.session_state['df_analyzed']
         total_cust = len(df_res)
         
-        metrics = st.session_state.get('metrics') or df_res.attrs.get('metrics', {'Accuracy': '82.50%', 'Precision': '78.40%', 'Recall': '80.10%', 'F1-Score': '0.7924', 'ROC-AUC': '0.8512'})
-        cm = st.session_state.get('confusion_matrix')
-        if cm is None:
-            cm = df_res.attrs.get('confusion_matrix', np.array([[max(1, int(total_cust*0.6)), max(0, int(total_cust*0.1))], [max(0, int(total_cust*0.1)), max(1, int(total_cust*0.2))]]))
-        roc_data = st.session_state.get('roc_curve')
-        if roc_data is None:
-            roc_data = df_res.attrs.get('roc_curve', {'fpr': [0.0, 0.2, 0.5, 1.0], 'tpr': [0.0, 0.6, 0.85, 1.0], 'auc': 0.8512})
+        # Use only metrics calculated from actual labels vs predictions.
+        # No hard-coded fallback values.
+        metrics = st.session_state.get('metrics', {
+            'Accuracy': 'N/A',
+            'Precision': 'N/A',
+            'Recall': 'N/A',
+            'F1-Score': 'N/A',
+            'ROC-AUC': 'N/A'
+        })
+
+        cm = st.session_state.get(
+            'confusion_matrix',
+            np.array([[0, 0], [0, 0]])
+        )
+
+        roc_data = st.session_state.get(
+            'roc_curve',
+            {'fpr': [0.0, 1.0], 'tpr': [0.0, 1.0], 'auc': None}
+        )
 
         st.markdown("""
         <div class="dark-card">
             <div class="dark-card-title">⚙️ Machine Learning Model Performance &amp; Evaluation Diagnostics</div>
             <p style="color: #94A3B8; font-size: 14px;">
-                Accuracy, Precision, Recall, F1-Score, Confusion Matrix, and ROC Curve evaluated on dataset predictions.
+                Accuracy, Precision, Recall, F1-Score, Confusion Matrix, and ROC Curve calculated from historical churn labels versus model predictions.
             </p>
         </div>
         """, unsafe_allow_html=True)
@@ -864,13 +1005,19 @@ elif nav == "6. Model Performance & ROC Curve":
             st.subheader("ROC Curve")
             fpr = roc_data.get('fpr', [0.0, 0.2, 0.5, 1.0])
             tpr = roc_data.get('tpr', [0.0, 0.6, 0.85, 1.0])
-            auc_score = roc_data.get('auc', 0.8512)
+            auc_score = roc_data.get('auc')
 
             fig_roc = go.Figure()
+
+            if auc_score is not None:
+                roc_name = f"ROC Curve (AUC = {auc_score:.3f})"
+            else:
+                roc_name = "ROC Curve (AUC unavailable)"
+
             fig_roc.add_trace(go.Scatter(
-                x=fpr, y=tpr, 
-                mode='lines', 
-                name=f"ROC Curve (AUC = {auc_score:.3f})",
+                x=fpr, y=tpr,
+                mode='lines',
+                name=roc_name,
                 line=dict(color='#06B6D4', width=3)
             ))
             fig_roc.add_trace(go.Scatter(
