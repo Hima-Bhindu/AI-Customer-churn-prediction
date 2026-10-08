@@ -7,8 +7,9 @@ This module provides the dynamic, dataset-independent ChurnPredictor class:
 - Preprocesses arbitrary numerical and categorical features dynamically (imputation, encoding, scaling).
 - Evaluates model compatibility with pre-trained benchmark models or adaptively trains an ML classifier on the uploaded dataset.
 - Derives customer-level Explainable AI risk factors based on feature contributions towards churn prediction.
-- Performs unsupervised K-Means behavior mining on uploaded customer attributes.
-- Computes Accuracy, Precision, Recall, F1-Score, ROC-AUC, Confusion Matrix, and ROC Curve.
+- Performs unsupervised K-Means behavior mining on uploaded customer attributes, selecting optimal K via Silhouette Score.
+- Projects behavior features into 2D via PCA for cluster visualization with exact N scatter points.
+- Calculates supervised classification performance metrics (Accuracy, Precision, Recall, F1-Score, ROC-AUC, Confusion Matrix, ROC Curve).
 """
 
 import os
@@ -18,9 +19,10 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score, 
-    roc_auc_score, confusion_matrix, roc_curve
+    silhouette_score, accuracy_score, precision_score, 
+    recall_score, f1_score, roc_auc_score, confusion_matrix, roc_curve
 )
 
 class ChurnPredictor:
@@ -31,12 +33,6 @@ class ChurnPredictor:
         self.scaler = joblib.load(os.path.join(models_dir, "scaler.pkl")) if os.path.exists(os.path.join(models_dir, "scaler.pkl")) else None
         self.feature_columns = joblib.load(os.path.join(models_dir, "feature_columns.pkl")) if os.path.exists(os.path.join(models_dir, "feature_columns.pkl")) else None
         self.model = joblib.load(os.path.join(models_dir, "best_model.pkl")) if os.path.exists(os.path.join(models_dir, "best_model.pkl")) else None
-
-        # Load benchmark K-Means artifacts if present
-        self.kmeans_model = joblib.load(os.path.join(models_dir, "kmeans_model.pkl")) if os.path.exists(os.path.join(models_dir, "kmeans_model.pkl")) else None
-        self.kmeans_scaler = joblib.load(os.path.join(models_dir, "kmeans_scaler.pkl")) if os.path.exists(os.path.join(models_dir, "kmeans_scaler.pkl")) else None
-        self.kmeans_features = joblib.load(os.path.join(models_dir, "kmeans_features.pkl")) if os.path.exists(os.path.join(models_dir, "kmeans_features.pkl")) else None
-        self.kmeans_segment_mapping = joblib.load(os.path.join(models_dir, "kmeans_segment_mapping.pkl")) if os.path.exists(os.path.join(models_dir, "kmeans_segment_mapping.pkl")) else {}
 
     def detect_activity_column(self, df):
         """
@@ -202,7 +198,9 @@ class ChurnPredictor:
         """
         Dynamically processes ANY uploaded customer DataFrame:
         - Calculates customer-level churn probabilities, risk levels, behavior segments, and model explanations.
-        - Computes Accuracy, Precision, Recall, F1-Score, ROC-AUC, Confusion Matrix, and ROC Curve.
+        - Selects optimal K for K-Means using Silhouette Score.
+        - Projects behavior features into 2D via PCA for cluster visualization with exact N scatter points.
+        - Computes classification performance metrics (Accuracy, Precision, Recall, F1, ROC-AUC, Confusion Matrix, ROC Curve).
         - Guarantees result row count EXACTLY equals uploaded dataset row count.
         """
         df_raw = df_input.copy()
@@ -284,7 +282,7 @@ class ChurnPredictor:
 
                 df_bm['TenureGroup'] = pd.cut(df_bm['tenure'], bins=[-1, 12, 24, 48, 72], labels=['0-12m', '12-24m', '24-48m', '48-72m'])
 
-                cols_to_drop = [c for c in [id_col, churn_col, 'Churn_Numeric', 'BehaviorSegment', 'BehaviorCluster'] if c and c in df_bm.columns]
+                cols_to_drop = [c for c in [id_col, churn_col, 'Churn_Numeric', 'BehaviorSegment'] if c and c in df_bm.columns]
                 X_raw = df_bm.drop(columns=cols_to_drop)
 
                 cat_cols = X_raw.select_dtypes(include=['object', 'category']).columns.tolist()
@@ -385,7 +383,7 @@ class ChurnPredictor:
                 
                 model_status_msg = "Historical churn target not found. Evaluated using dynamic behavioral risk scoring."
 
-        # 4. Unsupervised K-Means Behavior Mining on Uploaded Features
+        # 4. Unsupervised K-Means Behavior Mining & Silhouette Score Selection
         drop_cols_km = [c for c in [id_col, churn_col] if c and c in df_raw.columns]
         X_km_df = df_raw.drop(columns=drop_cols_km)
         cat_km = X_km_df.select_dtypes(include=['object', 'category']).columns.tolist()
@@ -399,36 +397,71 @@ class ChurnPredictor:
 
         X_km_enc = pd.get_dummies(X_km_clean, columns=cat_km, drop_first=True)
 
+        optimal_k = 3
+        best_silhouette = 0.0
+        pca_df = None
+        cluster_labels_list = []
+        segment_names = []
+
         if not X_km_enc.empty and n_rows >= 3:
             scaler_km = StandardScaler()
             X_km_scaled = scaler_km.fit_transform(X_km_enc)
-            
-            n_clusters = 3 if n_rows >= 10 else 2
-            km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            cluster_ids = km.fit_predict(X_km_scaled)
 
-            cluster_df = pd.DataFrame(X_km_scaled, columns=X_km_enc.columns)
-            cluster_df['Cluster'] = cluster_ids
-            means = cluster_df.groupby('Cluster').mean()
+            # Evaluate candidate K values using Silhouette Score
+            max_k = min(6, n_rows - 1)
+            if max_k >= 2:
+                best_k = 2
+                best_sil = -1.0
+                for k_cand in range(2, max_k + 1):
+                    try:
+                        km_cand = KMeans(n_clusters=k_cand, random_state=42, n_init=10)
+                        lbls_cand = km_cand.fit_predict(X_km_scaled)
+                        if len(set(lbls_cand)) > 1:
+                            sil = silhouette_score(X_km_scaled, lbls_cand)
+                            if sil > best_sil:
+                                best_sil = sil
+                                best_k = k_cand
+                    except Exception:
+                        pass
+                optimal_k = best_k
+                best_silhouette = max(0.0, float(best_sil))
+            else:
+                optimal_k = 2
+                best_silhouette = 0.50
 
-            segment_names = []
+            km_final = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+            cluster_ids = km_final.fit_predict(X_km_scaled)
+            cluster_labels_list = [f"Cluster {c}" for c in cluster_ids]
+
+            # 2D PCA projection for Behavior Mining Visualization
+            if X_km_scaled.shape[1] >= 2:
+                pca = PCA(n_components=2, random_state=42)
+                pca_coords = pca.fit_transform(X_km_scaled)
+                pca_df = pd.DataFrame({
+                    'PCA_1': pca_coords[:, 0],
+                    'PCA_2': pca_coords[:, 1],
+                    'Cluster': cluster_labels_list,
+                    'customerID': customer_ids
+                }, index=df_raw.index)
+
+            # Calculate cluster profile means to generate dynamic descriptive cluster names
+            cluster_df = pd.DataFrame(X_km_clean[num_km] if len(num_km)>0 else X_km_scaled)
+            cluster_df['Cluster_ID'] = cluster_ids
+            means = cluster_df.groupby('Cluster_ID').mean()
+
             for cid in cluster_ids:
-                c_means = means.loc[cid]
-                top_pos = c_means.idxmax()
-                top_neg = c_means.idxmin()
-                
-                pos_clean = top_pos.replace('_', ' ').replace('Yes', '').strip()
-                neg_clean = top_neg.replace('_', ' ').replace('Yes', '').strip()
-                
-                if cid == 0:
-                    name = f"Segment A: High {pos_clean}" if pos_clean else "Segment A: Core Customer Base"
-                elif cid == 1:
-                    name = f"Segment B: Moderate {pos_clean}" if pos_clean else "Segment B: Transitional Segment"
+                if len(num_km) > 0:
+                    c_row = means.loc[cid]
+                    top_feat = c_row.idxmax()
+                    val = c_row[top_feat]
+                    segment_names.append(f"Cluster {cid}: High {top_feat} ({val:.1f})")
                 else:
-                    name = f"Segment C: Low {neg_clean}" if neg_clean else "Segment C: Specialized Segment"
-                segment_names.append(name)
+                    segment_names.append(f"Cluster {cid}: Behavioral Segment")
         else:
-            segment_names = ["Standard Customer Segment"] * n_rows
+            optimal_k = 1
+            best_silhouette = 1.00
+            cluster_labels_list = ["Cluster 0"] * n_rows
+            segment_names = ["Cluster 0: Core Customer Segment"] * n_rows
 
         # 5. Risk Classification
         risk_levels = []
@@ -455,8 +488,10 @@ class ChurnPredictor:
             prec = precision_score(y_true, y_pred, zero_division=0)
             rec = recall_score(y_true, y_pred, zero_division=0)
             f1 = f1_score(y_true, y_pred, zero_division=0)
+            
+            # Confusion Matrix with guaranteed 2x2 shape
             cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-
+            
             if len(set(y_true)) > 1:
                 try:
                     auc_val = roc_auc_score(y_true, probas)
@@ -491,8 +526,8 @@ class ChurnPredictor:
             'ChurnProbability': [f"{p*100:.1f}%" for p in probas],
             'PredictedChurn': pred_labels,
             'RiskLevel': risk_levels,
+            'BehaviorCluster': cluster_labels_list,
             'BehaviorSegment': segment_names,
-            'BehaviorCluster': segment_names,
             'ImportantRiskFactors': explanations
         }, index=df_raw.index)
 
@@ -500,6 +535,9 @@ class ChurnPredictor:
         res_df.attrs['feat_importances'] = feat_importances_df
         res_df.attrs['model_status_msg'] = model_status_msg
         res_df.attrs['churn_target_present'] = churn_col is not None
+        res_df.attrs['optimal_k'] = optimal_k
+        res_df.attrs['best_silhouette'] = best_silhouette
+        res_df.attrs['pca_df'] = pca_df
         res_df.attrs['metrics'] = metrics_dict
         res_df.attrs['confusion_matrix'] = cm
         res_df.attrs['roc_curve'] = roc_data
@@ -509,12 +547,12 @@ class ChurnPredictor:
 if __name__ == "__main__":
     predictor = ChurnPredictor()
     test_df = pd.DataFrame({
-        "CustomerID": ["C001", "C002", "C003"],
-        "TenureMonths": [2, 18, 45],
-        "MonthlySpend": [95.0, 45.0, 70.0],
-        "SupportCalls": [5, 1, 0],
-        "SatisfactionScore": [1, 4, 5]
+        "CustomerID": ["C001", "C002", "C003", "C004", "C005"],
+        "TenureMonths": [2, 18, 45, 1, 60],
+        "MonthlySpend": [95.0, 45.0, 70.0, 110.0, 25.0],
+        "SupportCalls": [5, 1, 0, 6, 0],
+        "SatisfactionScore": [1, 4, 5, 1, 5]
     })
     res = predictor.predict_batch(test_df)
     print("Execution Success. Customer count:", len(res))
-    print(res[['customerID', 'ChurnProbability', 'RiskLevel', 'ImportantRiskFactors']])
+    print(res[['customerID', 'ChurnProbability', 'RiskLevel', 'BehaviorCluster', 'ImportantRiskFactors']])
