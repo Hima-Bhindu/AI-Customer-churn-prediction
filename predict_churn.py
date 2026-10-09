@@ -106,7 +106,7 @@ class ChurnPredictor:
             imp_map = dict(zip(feat_importances_df['Feature'], feat_importances_df['Importance']))
 
         for idx, row in df_raw.iterrows():
-            prob = probas[idx] if idx < len(probas) else 0.5
+            prob = probas[df_raw.index.get_loc(idx)] if idx in df_raw.index else 0.5
             factors = []
 
             # 1. Satisfaction / NPS (lower = risk)
@@ -247,7 +247,7 @@ class ChurnPredictor:
         y_true = None
 
         if churn_col and churn_col in df_raw.columns:
-            y_true = (df_raw[churn_col].astype(str).str.lower().isin(['yes', '1', 'true', 'churned'])).astype(int).values
+            y_true = (df_raw[churn_col].astype(str).str.lower().isin(['yes', '1', '1.0', 'true', 'churned', 'churn', 'y', 'exited', 'cancelled', 'canceled'])).astype(int).values
 
         if is_benchmark_schema and self.model is not None and self.scaler is not None and self.feature_columns is not None:
             # Pre-trained Benchmark Model Inference
@@ -303,10 +303,18 @@ class ChurnPredictor:
             except Exception as e:
                 is_benchmark_schema = False
 
-        if not is_benchmark_schema:
+        if not (is_benchmark_schema and self.model is not None and self.scaler is not None and self.feature_columns is not None) or 'probas' not in locals():
             is_adaptive = True
+            # Exclude target-derived columns as well as the target itself.
+            # For example, Churn_Numeric duplicates Churn and would leak the answer.
+            leakage_names = {
+                'churnnumeric', 'churn_numeric', 'churnlabel', 'churn_label',
+                'ischurn', 'is_churn', 'churnflag', 'churn_flag',
+                'targetnumeric', 'target_numeric', 'targetlabel', 'target_label'
+            }
             drop_cols = [c for c in [id_col, churn_col] if c and c in df_raw.columns]
-            X_df = df_raw.drop(columns=drop_cols)
+            drop_cols += [c for c in df_raw.columns if c.lower().replace(' ', '') in leakage_names]
+            X_df = df_raw.drop(columns=list(dict.fromkeys(drop_cols)))
 
             # Variables used by the evaluation section below.
             acc = prec = rec = f1 = float('nan')
@@ -329,7 +337,7 @@ class ChurnPredictor:
                     y_raw.astype(str)
                     .str.strip()
                     .str.lower()
-                    .isin(['yes', '1', 'true', 'churned', 'churn'])
+                    .isin(['yes', '1', '1.0', 'true', 'churned', 'churn', 'y', 'exited', 'cancelled', 'canceled'])
                     .astype(int)
                     .values
                 )
@@ -369,12 +377,11 @@ class ChurnPredictor:
 
                 if not X_enc.empty and len(np.unique(y_num)) == 2:
 
-                    scaler_adapt = StandardScaler()
-                    X_scaled_adapt = scaler_adapt.fit_transform(X_enc)
-
-                    # Stratified split keeps the churn/non-churn ratio similar.
+                    # Split before fitting any learned preprocessing to avoid
+                    # leaking test-set statistics into evaluation. Random Forest
+                    # does not require feature scaling.
                     X_train, X_test, y_train, y_test = train_test_split(
-                        X_scaled_adapt,
+                        X_enc,
                         y_num,
                         test_size=0.20,
                         random_state=42,
@@ -446,9 +453,7 @@ class ChurnPredictor:
                     # These predictions are for the dashboard.
                     # Metrics above remain test-set metrics.
                     # -----------------------------------------------------
-                    probas = adapt_clf.predict_proba(
-                        X_scaled_adapt
-                    )[:, 1]
+                    probas = adapt_clf.predict_proba(X_enc)[:, 1]
 
                     imp = adapt_clf.feature_importances_
 
@@ -469,20 +474,15 @@ class ChurnPredictor:
                 elif not X_enc.empty:
                     # A supervised model cannot be evaluated when the
                     # target contains only one class.
-                    scaler_adapt = StandardScaler()
-                    X_scaled_adapt = scaler_adapt.fit_transform(X_enc)
-
                     adapt_clf = RandomForestClassifier(
                         n_estimators=100,
                         max_depth=6,
                         random_state=42
                     )
 
-                    adapt_clf.fit(X_scaled_adapt, y_num)
+                    adapt_clf.fit(X_enc, y_num)
 
-                    probas = adapt_clf.predict_proba(
-                        X_scaled_adapt
-                    )[:, 1]
+                    probas = adapt_clf.predict_proba(X_enc)[:, 1]
 
                     imp = adapt_clf.feature_importances_
 
@@ -503,7 +503,7 @@ class ChurnPredictor:
                     probas = np.full(n_rows, 0.5)
 
                     model_status_msg = (
-                        "Insufficient feature variation for ML training"
+                        "Insufficient feature variation for ML training; neutral 50% estimate used"
                     )
 
             else:
@@ -605,7 +605,7 @@ class ChurnPredictor:
                     )
 
                 else:
-                    probas = np.full(n_rows, 0.35)
+                    probas = np.full(n_rows, 0.50)
 
                 model_status_msg = (
                     "Historical churn target not found. "
@@ -613,8 +613,20 @@ class ChurnPredictor:
                 )
 
         # 4. Unsupervised K-Means Behavior Mining & Silhouette Score Selection
+        target_proxy_names = {
+            'churnnumeric', 'churn_numeric', 'churnlabel', 'churn_label',
+            'ischurn', 'is_churn', 'churnflag', 'churn_flag',
+            'targetnumeric', 'target_numeric', 'targetlabel', 'target_label',
+            'predictedchurn', 'predicted_churn', 'churnprobability',
+            'churnprobability_raw', 'risklevel', 'behaviorsegment',
+            'behavior_segment'
+        }
         drop_cols_km = [c for c in [id_col, churn_col] if c and c in df_raw.columns]
-        X_km_df = df_raw.drop(columns=drop_cols_km)
+        drop_cols_km += [
+            c for c in df_raw.columns
+            if c.lower().replace(' ', '') in target_proxy_names
+        ]
+        X_km_df = df_raw.drop(columns=list(dict.fromkeys(drop_cols_km)))
         cat_km = X_km_df.select_dtypes(include=['object', 'category']).columns.tolist()
         num_km = X_km_df.select_dtypes(include=[np.number]).columns.tolist()
 
@@ -622,7 +634,7 @@ class ChurnPredictor:
         for nc in num_km:
             X_km_clean[nc] = pd.to_numeric(X_km_clean[nc], errors='coerce').fillna(X_km_clean[nc].median() if not X_km_clean[nc].dropna().empty else 0)
         for cc in cat_km:
-            X_km_clean[cc] = X_km_clean[cc].astype(str).fillna('Unknown')
+            X_km_clean[cc] = X_km_clean[cc].fillna('Unknown').astype(str)
 
         X_km_enc = pd.get_dummies(X_km_clean, columns=cat_km, drop_first=True)
 
@@ -656,7 +668,7 @@ class ChurnPredictor:
                 best_silhouette = max(0.0, float(best_sil))
             else:
                 optimal_k = 2
-                best_silhouette = 0.50
+                best_silhouette = float("nan")
 
             km_final = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
             cluster_ids = km_final.fit_predict(X_km_scaled)
@@ -688,7 +700,7 @@ class ChurnPredictor:
                     segment_names.append(f"Cluster {cid}: Behavioral Segment")
         else:
             optimal_k = 1
-            best_silhouette = 1.00
+            best_silhouette = float("nan")
             cluster_labels_list = ["Cluster 0"] * n_rows
             segment_names = ["Cluster 0: Core Customer Segment"] * n_rows
 
