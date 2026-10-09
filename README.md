@@ -4,7 +4,7 @@ An AI-powered machine learning web application that predicts customer churn risk
 
 ## 🚀 Live Demo
 
-https://ai-customer-churn-prediction-mafbpjpjpzm8n3h42aiizx.streamlit.app/
+https://ai-customer-churn-prediction-production.up.railway.app/
 
 ## 📂 GitHub Repository
 
